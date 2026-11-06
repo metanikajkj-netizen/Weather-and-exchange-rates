@@ -1,0 +1,8 @@
+# Build
+build/
+.gradle/
+local.properties
+output/
+*.apk
+# Secrets — never commit (embedded proxy credentials)
+app/src/main/java/com/weathercurrency/app/proxy/ProxyEmbedded.kt
