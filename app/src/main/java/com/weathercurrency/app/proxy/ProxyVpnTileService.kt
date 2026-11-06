@@ -47,12 +47,16 @@ class ProxyVpnTileService : TileService() {
         val status = ProxyVpnService.lastStatus
         when (status) {
             ProxyVpnService.STATUS_CONNECTING -> {
-                refreshTile()
+                // Allow cancel while connecting — tile must stay interactive (TASK27.1).
+                ProxyVpnService.stop(this)
+                ProxyVpnService.lastStatus = VpnStatus.DISCONNECTED
             }
             ProxyVpnService.STATUS_CONNECTED -> {
                 ProxyVpnService.stop(this)
-                ProxyVpnService.lastStatus = ProxyVpnService.STATUS_CONNECTING
-                refreshTile()
+                // Optimistic OFF; service broadcast will confirm DISCONNECTED.
+                // Never park the tile in CONNECTING after a stop (it became
+                // STATE_UNAVAILABLE and stopped responding — TASK27.1).
+                ProxyVpnService.lastStatus = VpnStatus.DISCONNECTED
             }
             else -> connect()
         }
@@ -70,7 +74,7 @@ class ProxyVpnTileService : TileService() {
             launchConsent(consent)
             return
         }
-        ProxyVpnService.lastStatus = ProxyVpnService.STATUS_CONNECTING
+        ProxyVpnService.lastStatus = VpnStatus.CONNECTING
         ProxyVpnService.start(this)
     }
 
@@ -188,7 +192,7 @@ object ProxyTileUi {
             active = false,
             busy = true,
             label = "Подключение…",
-            subtitle = "Proxy VPN",
+            subtitle = "Нажмите, чтобы отменить",
         )
         VpnStatus.CONNECTED -> Visual(
             active = true,

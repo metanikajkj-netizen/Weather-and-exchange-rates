@@ -48,4 +48,13 @@ class ProxyTileStateTest {
         assertFalse(v.active)
         assertFalse(v.busy)
     }
+
+    @Test
+    fun afterStopTileIsInteractiveNotStuckConnecting() {
+        // Regression TASK27.1: disconnect must not leave tile in CONNECTING/UNAVAILABLE.
+        val v = ProxyTileUi.map(VpnStatus.DISCONNECTED, systemVpn = false)
+        assertFalse(v.busy)
+        assertFalse(v.active)
+        assertTrue(v.label.contains("Proxy VPN"))
+    }
 }

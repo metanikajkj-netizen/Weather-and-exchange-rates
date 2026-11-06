@@ -35,6 +35,7 @@ class ProxyVpnService : VpnService() {
 
     private var tunPfd: ParcelFileDescriptor? = null
     private var engineRunning = false
+    @Volatile private var stopping = false
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -105,10 +106,13 @@ class ProxyVpnService : VpnService() {
                 stopSelf()
                 return
             }
-            tunPfd = pfd
+            // Engine owns the TUN fd: detach so Java never closes it twice
+            // (double-close of a recycled fd crashed the app on VPN stop — TASK27.1).
+            val tunFd = pfd.detachFd()
+            tunPfd = null
 
             val key = Key()
-            key.setDevice("fd://${pfd.fd}")
+            key.setDevice("fd://$tunFd")
             key.setProxy(proxyCfg.toProxyUrl())
             key.setLogLevel("info") // DNS diagnostics (DoH/SERVFAIL) must not be hidden
             key.setMark(0)
@@ -138,9 +142,29 @@ class ProxyVpnService : VpnService() {
     }
 
     private fun stopVpn() {
-        cleanupEngine()
-        stopForegroundCompat()
-        sendStatus(STATUS_DISCONNECTED, "VPN отключён")
+        // Idempotent: tile + app may both send ACTION_STOP (TASK27.1).
+        if (!stopping && (engineRunning || tunPfd != null)) {
+            stopping = true
+            try {
+                cleanupEngine()
+                stopForegroundCompat()
+                sendStatus(STATUS_DISCONNECTED, "VPN отключён")
+            } catch (e: Exception) {
+                Log.e(TAG, "stopVpn", e)
+                try {
+                    sendStatus(STATUS_DISCONNECTED, "VPN отключён")
+                } catch (_: Exception) {
+                }
+            } finally {
+                stopping = false
+            }
+        } else if (!engineRunning && tunPfd == null) {
+            // Already stopped — still report DISCONNECTED so UI/tile unstick.
+            try {
+                sendStatus(STATUS_DISCONNECTED, "VPN отключён")
+            } catch (_: Exception) {
+            }
+        }
         stopSelf()
     }
 
@@ -153,6 +177,8 @@ class ProxyVpnService : VpnService() {
             }
             engineRunning = false
         }
+        // TUN fd is owned by the Go engine after detachFd(); only close if
+        // we still hold a PFD (start failed before detach).
         try {
             tunPfd?.close()
         } catch (_: Exception) {
@@ -161,16 +187,28 @@ class ProxyVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        cleanupEngine()
+        try {
+            cleanupEngine()
+        } catch (_: Exception) {
+        }
         serviceScope.cancel()
         super.onDestroy()
     }
 
     override fun onRevoke() {
         // System revoked VPN (another VPN or user action)
-        cleanupEngine()
-        sendStatus(STATUS_ERROR, "VPN отозван системой")
-        stopForegroundCompat()
+        if (!stopping) {
+            stopping = true
+            try {
+                cleanupEngine()
+                stopForegroundCompat()
+                sendStatus(STATUS_ERROR, "VPN отозван системой")
+            } catch (e: Exception) {
+                Log.e(TAG, "onRevoke", e)
+            } finally {
+                stopping = false
+            }
+        }
         stopSelf()
     }
 
