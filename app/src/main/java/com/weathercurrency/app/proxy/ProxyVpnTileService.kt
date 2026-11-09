@@ -15,7 +15,7 @@ import android.app.PendingIntent
 
 /**
  * Quick Settings tile: one tap toggles the existing Proxy VPN
- * (same engine + [ProxyEmbedded] config — no second tunnel).
+ * (same engine + per-device subscription creds — no second tunnel).
  *
  * States: inactive / active / unavailable (connecting) / label for error.
  * Consent (VpnService.prepare) opens the system dialog only — not the app UI.
@@ -64,6 +64,31 @@ class ProxyVpnTileService : TileService() {
     }
 
     private fun connect() {
+        // TASK26.5: tile must also respect subscription (server enforces too).
+        val subOk = try {
+            com.weathercurrency.app.subscription.SubscriptionStore(this).hasActiveSubscriptionSync() &&
+                com.weathercurrency.app.subscription.SubscriptionStore(this).vpnConfigSync() != null
+        } catch (_: Exception) {
+            false
+        }
+        if (!subOk) {
+            ProxyVpnService.lastStatus = VpnStatus.ERROR
+            // Open app so user can activate a promo.
+            try {
+                val app = Intent(this, com.weathercurrency.app.MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivityAndCollapse(
+                    PendingIntent.getActivity(
+                        this, 2103, app,
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                    )
+                )
+            } catch (_: Exception) {
+            }
+            refreshTile()
+            return
+        }
         val consent = try {
             VpnService.prepare(this)
         } catch (_: Exception) {

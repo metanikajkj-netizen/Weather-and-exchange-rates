@@ -5,6 +5,7 @@ package com.weathercurrency.app.proxy
  * No Android imports — safe for unit tests.
  */
 object VpnStatus {
+    const val STARTING = "starting"
     const val CONNECTING = "connecting"
     const val CONNECTED = "connected"
     const val DISCONNECTED = "disconnected"

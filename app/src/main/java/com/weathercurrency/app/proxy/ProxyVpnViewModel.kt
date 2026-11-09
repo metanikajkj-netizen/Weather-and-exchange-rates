@@ -14,11 +14,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.weathercurrency.app.data.NetworkDiag
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class VpnUiState { Disconnected, Connecting, Connected, Error }
 
@@ -37,8 +39,9 @@ data class ProxyUiState(
 )
 
 /**
- * Proxy VPN view-model for the two-button UI (TASK25).
- * Configuration always comes from [ProxyEmbedded] — no user-editable fields.
+ * Proxy VPN view-model for the two-button UI (TASK25/26.5).
+ * VPN gateway config comes from [com.weathercurrency.app.subscription.SubscriptionStore]
+ * (per-device credentials fetched from Auth API).
  * Never copies password into logs or user-facing messages.
  */
 class ProxyVpnViewModel(application: Application) : AndroidViewModel(application) {
@@ -52,14 +55,9 @@ class ProxyVpnViewModel(application: Application) : AndroidViewModel(application
     private var statusReceiver: BroadcastReceiver? = null
 
     init {
-        val cfg = ProxyEmbedded.config
+        // Config is loaded from SubscriptionStore by Activity before connect (TASK26.5).
         _ui.update {
-            it.copy(
-                config = cfg,
-                hasSavedConfig = cfg.isConfigured,
-                vpnState = VpnUiState.Disconnected,
-                vpnMessage = "",
-            )
+            it.copy(vpnState = VpnUiState.Disconnected, vpnMessage = "")
         }
         refreshSystemVpnStatus()
         registerStatusReceiver()
@@ -77,21 +75,44 @@ class ProxyVpnViewModel(application: Application) : AndroidViewModel(application
         _ui.update { it.copy(systemVpnActive = active) }
     }
 
-    /** Runs proxy reachability check using the embedded config. Does not start VPN. */
+    /** Runs gateway reachability check using per-device creds. Does not start VPN. */
     fun runTest() {
-        val cfg = _ui.value.config
-        if (cfg == null || !cfg.isConfigured) {
-            _ui.update {
-                it.copy(testSuccess = false, testMessage = "Не удалось подключиться к серверу")
-            }
-            return
-        }
         if (_ui.value.testing) return
         if (_ui.value.vpnState == VpnUiState.Connecting) return
         _ui.update {
             it.copy(testing = true, testMessage = null, testSuccess = null, testLatencyMs = null)
         }
         viewModelScope.launch {
+            // Fetch VPN credentials if not available (or expired)
+            val cfg = withContext(Dispatchers.IO) {
+                var c = com.weathercurrency.app.subscription.SubscriptionStore(app).vpnConfigSync()
+                if (c == null || !c.isConfigured) {
+                    // Fetch fresh credentials from server
+                    try {
+                        val api = com.weathercurrency.app.subscription.SubscriptionApi()
+                        val did = com.weathercurrency.app.subscription.SubscriptionStore(app).deviceId()
+                        if (!did.isNullOrBlank()) {
+                            val nonce = api.challenge(did)
+                            val sig = android.util.Base64.encodeToString(
+                                com.weathercurrency.app.subscription.DeviceIdentity.sign(nonce.toByteArray()),
+                                android.util.Base64.NO_WRAP
+                            )
+                            val creds = api.vpnCredentials(did, nonce, sig)
+                            com.weathercurrency.app.subscription.SubscriptionStore(app)
+                                .saveVpnCreds(creds.username, creds.password, creds.expiresAt)
+                            c = com.weathercurrency.app.subscription.SubscriptionStore(app).vpnConfigSync()
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                c
+            }
+            if (cfg == null || !cfg.isConfigured) {
+                _ui.update {
+                    it.copy(testing = false, testSuccess = false, testMessage = "Не удалось подключиться к серверу")
+                }
+                return@launch
+            }
             val result = tester.test(cfg)
             // User-facing copy only — no technical errors, hosts, or credentials.
             _ui.update {
@@ -117,13 +138,8 @@ class ProxyVpnViewModel(application: Application) : AndroidViewModel(application
     fun connect() {
         val st = _ui.value.vpnState
         if (st == VpnUiState.Connecting || st == VpnUiState.Connected) return
-        val cfg = _ui.value.config
-        if (cfg == null || !cfg.isConfigured) {
-            _ui.update {
-                it.copy(vpnState = VpnUiState.Error, vpnMessage = "Ошибка соединения")
-            }
-            return
-        }
+        // Subscription gate runs in Activity/Tile before this call (TASK26.5).
+        // Service loads per-device creds from SubscriptionStore itself.
         doStart()
     }
 

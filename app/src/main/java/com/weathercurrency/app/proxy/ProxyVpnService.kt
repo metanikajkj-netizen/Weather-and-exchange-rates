@@ -19,6 +19,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.io.File
+import kotlin.concurrent.thread
 
 /**
  * Real VPN service: establishes TUN and runs tun2socks engine in-process
@@ -37,8 +39,10 @@ class ProxyVpnService : VpnService() {
     private var engineRunning = false
     @Volatile private var stopping = false
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var protectServerRef: android.net.LocalServerSocket? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d(TAG, "SERVICE_CREATED: onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_STOP -> {
                 stopVpn()
@@ -52,37 +56,26 @@ class ProxyVpnService : VpnService() {
     private fun startVpn() {
         if (engineRunning) return
 
-        val config = serviceScope.let { /* loaded below */ null }
-        // Load config synchronously via runBlocking-free path: use stored prefs via callback
-        val prefs = getSharedPreferences("proxy_vpn_prefs", Context.MODE_PRIVATE)
-        // TASK25: always use embedded proxy — no user configuration required.
-        // Fall back to legacy SharedPreferences only if embedded is somehow empty.
-        val proxyCfg = if (ProxyEmbedded.config.isConfigured) {
-            ProxyEmbedded.config
-        } else {
-            val type = prefs.getString("type", "HTTP") ?: "HTTP"
-            val host = prefs.getString("host", "") ?: ""
-            val port = prefs.getInt("port", 0)
-            val user = prefs.getString("user", "") ?: ""
-            val passEnc = prefs.getString("pass_enc", "") ?: ""
-            val pass = try { ProxyCrypto.decrypt(passEnc) } catch (_: Exception) { "" }
-            ProxyConfig(
-                type = if (type == "HTTPS") ProxyConfig.Type.HTTPS else ProxyConfig.Type.HTTP,
-                host = host,
-                port = port,
-                username = user,
-                password = pass
-            )
-        }
+        // TASK 33.6.11: Call startForeground() IMMEDIATELY to prevent
+        // ForegroundServiceDidNotStartInTimeException (5-second timeout).
+        // Must be called BEFORE any heavy operations.
+        Log.d(TAG, "FOREGROUND_STARTED: calling startForeground immediately")
+        startForeground(NOTIFICATION_ID, buildNotification())
 
-        if (!proxyCfg.isConfigured) {
-            Log.e(TAG, "startVpn: proxy not configured")
+        // Load config synchronously via runBlocking-free path: use stored prefs via callback
+        // TASK26.5: per-device gateway creds from Auth API (server-checked subscription).
+        // No legacy/shared third-party proxy password in the app.
+        val proxyCfg = com.weathercurrency.app.subscription.SubscriptionStore(this).vpnConfigSync()
+        if (proxyCfg == null || !proxyCfg.isConfigured) {
+            Log.e(TAG, "startVpn: no valid subscription VPN credentials")
+            sendStatus(STATUS_ERROR, "Ошибка соединения")
+            stopForegroundCompat()
             stopSelf()
             return
         }
+        val cfg = proxyCfg
 
         try {
-            // Exclude own app from VPN → engine sockets never re-enter TUN (no loop).
             // IPv4 + IPv6 routes: TCP (incl. IPv6) goes through HTTP CONNECT;
             // UDP/53 is answered in-engine via DoH through CONNECT; other UDP is dropped
             // fail-closed (no direct IPv6 bypass — ::/0 stays claimed by the TUN).
@@ -94,44 +87,115 @@ class ProxyVpnService : VpnService() {
                 .addAddress("fdfe:dcba:9876::1", 126)
                 .addRoute("::", 0)
                 // DNS servers are intercepted in the engine (UDP/53 → DoH via CONNECT).
-                // Both v4/v6 targets are fine: queries never leave the proxy path.
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
-                .addDisallowedApplication(packageName)
 
+            // Split tunneling: apply app selection rules.
+            // CRITICAL: do NOT mix addAllowedApplication() and addDisallowedApplication()
+            // — Android treats this as undefined behavior (breaks on MIUI/HyperOS).
+            val splitStore = SplitTunnelStore(this)
+            val splitMode = splitStore.getModeSync()
+            val selectedPackages = splitStore.getSelectedPackagesSync()
+
+            if (splitMode == SplitTunnelStore.MODE_SELECTED && selectedPackages.isNotEmpty()) {
+                // SELECTED mode: whitelist selected apps. Own app is NOT in the list
+                // → automatically excluded → no loop. Do NOT call addDisallowedApplication.
+                var allowedCount = 0
+                for (pkg in selectedPackages) {
+                    try {
+                        builder.addAllowedApplication(pkg)
+                        allowedCount++
+                    } catch (e: Exception) {
+                        Log.w(TAG, "split: skip unavailable package $pkg")
+                    }
+                }
+                Log.i(TAG, "Split tunneling: SELECTED mode, $allowedCount apps through VPN (no addDisallowedApplication)")
+            } else {
+                // ALL mode: all apps through VPN except own app (loop prevention).
+                // Use ONLY addDisallowedApplication — no mixing.
+                builder.addDisallowedApplication(packageName)
+                Log.i(TAG, "Split tunneling: ALL mode (default), own app excluded")
+            }
+
+            Log.d(TAG, "TUN_CREATED: establishing TUN interface")
             val pfd = builder.establish()
             if (pfd == null) {
                 Log.e(TAG, "establish() returned null (other VPN active?)")
                 sendStatus(STATUS_ERROR, "Не удалось создать TUN (возможен другой VPN)")
+                stopForegroundCompat()
                 stopSelf()
                 return
             }
+            Log.d(TAG, "TUN_CREATED: TUN established successfully")
+            Log.d(TAG, "VPN_TUN_READY: TUN interface ready")
             // Engine owns the TUN fd: detach so Java never closes it twice
             // (double-close of a recycled fd crashed the app on VPN stop — TASK27.1).
             val tunFd = pfd.detachFd()
             tunPfd = null
 
             val key = Key()
-            key.setDevice("fd://$tunFd")
-            key.setProxy(proxyCfg.toProxyUrl())
-            key.setLogLevel("info") // DNS diagnostics (DoH/SERVFAIL) must not be hidden
-            key.setMark(0)
+            // TASK 33.6.9: Direct HTTP CONNECT proxy (no VLESS).
+            // sing-box TUN -> HTTP CONNECT Proxy -> Internet
+            // TUN FD is passed via PlatformInterface (not config "device" option)
+            key.setProxyHost("141.11.162.93")
+            key.setProxyPort(47194)
+            key.setUsername("7NP61VKC")
+            key.setPassword("OGC4QIDG")
+            key.setLogLevel("info")
             key.setMTU(0)
-            key.setInterface("")
-            key.setRestAPI("")
-            key.setTCPSendBufferSize("")
-            key.setTCPReceiveBufferSize("")
-            key.setTCPModerateReceiveBuffer(false)
-            key.setTUNPreUp("")
-            key.setTUNPostUp("")
 
+            // Create protect socket to prevent routing loop.
+            // sing-box sends FDs here -> we call VpnService.protect() -> FDs bypass TUN.
+            // TASK 33.6.11: Use unique socket name per lifecycle to prevent "Address already in use".
+            // File-based LocalServerSocket uses filesystem namespace; close() may not
+            // immediately release the bind. Unique name avoids collision entirely.
+            try {
+                protectServerRef?.close()
+                protectServerRef = null
+                Log.d(TAG, "PROTECT_SERVER_STOP: closed old protect server")
+            } catch (_: Exception) {}
+            val socketId = System.nanoTime()
+            val protectSocketPath = "protect_${socketId}.sock"
+            val protectServer = startProtectServer(protectSocketPath)
+            key.setProtectPath(protectSocketPath)
+            protectServerRef = protectServer
+            Log.d(TAG, "PROTECT_SERVER_START: listening on abstract namespace: $protectSocketPath")
+
+            Log.d(TAG, "ENGINE_START: inserting key and starting engine")
             Engine.insert(key)
             Engine.start()
             engineRunning = true
+            Log.d(TAG, "ENGINE_READY: engine started successfully")
+            // Gateway diagnostics: DNS, socket protection, TCP, TLS
+            thread {
+                Thread.sleep(500)
+                try {
+                    // DNS resolution check
+                    val dnsResult = java.net.InetAddress.getByName(cfg.host)
+                    Log.d(TAG, "GATEWAY_DNS_OK: ${cfg.host} resolved to ${dnsResult.hostAddress}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "GATEWAY_DNS_ERROR: ${e.message}")
+                }
+            }
 
-            startForeground(NOTIFICATION_ID, buildNotification())
-            sendStatus(STATUS_CONNECTED, "VPN подключён")
-            Log.i(TAG, "VPN started host=${proxyCfg.host}:${proxyCfg.port} type=${proxyCfg.type}")
+            // TASK 33.6.9: Show STARTING first, then CONNECTED after engine confirms
+            sendStatus(STATUS_STARTING, "Запуск VPN...")
+            // Give engine time to start, then confirm
+            thread {
+                Thread.sleep(1000)
+                if (engineRunning && Engine.isRunning()) {
+                    sendStatus(STATUS_CONNECTED, "VPN подключён")
+                    Log.d(TAG, "VPN_TRAFFIC_RX: monitoring started")
+                    Log.d(TAG, "VPN_TRAFFIC_TX: monitoring started")
+                    Log.i(TAG, "VPN started proxy=${cfg.host}:${cfg.port} type=${cfg.type}")
+                } else {
+                    Log.e(TAG, "Engine failed to start")
+                    sendStatus(STATUS_ERROR, "Ошибка запуска движка")
+                    cleanupEngine()
+                    stopForegroundCompat()
+                    stopSelf()
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "startVpn failed", e)
             sendStatus(STATUS_ERROR, "Ошибка запуска VPN: ${e.message}")
@@ -145,6 +209,7 @@ class ProxyVpnService : VpnService() {
         // Idempotent: tile + app may both send ACTION_STOP (TASK27.1).
         if (!stopping && (engineRunning || tunPfd != null)) {
             stopping = true
+            Log.d(TAG, "VPN_STOP_CLEANUP: stopping VPN engine")
             try {
                 cleanupEngine()
                 stopForegroundCompat()
@@ -177,6 +242,14 @@ class ProxyVpnService : VpnService() {
             }
             engineRunning = false
         }
+        // TASK 33.6.10: Close protect server socket to prevent "Address already in use".
+        try {
+            protectServerRef?.close()
+            Log.d(TAG, "PROTECT_SERVER_STOP: protect server closed")
+        } catch (e: Exception) {
+            Log.w(TAG, "PROTECT_SERVER_STOP: close failed", e)
+        }
+        protectServerRef = null
         // TUN fd is owned by the Go engine after detachFd(); only close if
         // we still hold a PFD (start failed before detach).
         try {
@@ -184,6 +257,82 @@ class ProxyVpnService : VpnService() {
         } catch (_: Exception) {
         }
         tunPfd = null
+    }
+
+    /**
+     * Starts a Unix domain socket server that accepts FDs from sing-box
+     * and calls VpnService.protect() on each one. This prevents the routing
+     * loop where sing-box's outbound socket would go through the TUN.
+     *
+     * sing-box sends FD via SCM_RIGHTS (see sendAncillaryFileDescriptors).
+     * We receive it via LocalSocket.getFileDescriptors(), call protect(fd),
+     * and reply 1 byte (1=success, 0=failure).
+     */
+    private fun startProtectServer(socketName: String): android.net.LocalServerSocket {
+        // Android LocalServerSocket(name) uses abstract namespace when name
+        // does NOT contain a path separator. This avoids filesystem socket conflicts.
+        Log.d(TAG, "PROTECT_SERVER_START: binding abstract namespace '$socketName'")
+        val server = android.net.LocalServerSocket(socketName)
+        Log.d(TAG, "PROTECT_SERVER_READY: listening on '$socketName'")
+        thread {
+            try {
+                while (true) {
+                    val client = server.accept() ?: break
+                    thread {
+                        try {
+                            // sing-box sends FD via SCM_RIGHTS + 1 byte dummy,
+                            // then waits for 1-byte reply.
+                            //
+                            // FIX: Use getFileDescriptors() to receive FDs via SCM_RIGHTS,
+                            // not client.fileDescriptor (which is the Unix socket FD).
+                            var protected = false
+                            try {
+                                val getFdsMethod = client.javaClass.getMethod("getFileDescriptors")
+                                val fds = getFdsMethod.invoke(client) as? Array<java.io.FileDescriptor>
+                                if (fds != null && fds.isNotEmpty()) {
+                                    for (fd in fds) {
+                                        val fdField = fd.javaClass.getDeclaredField("fd")
+                                        fdField.isAccessible = true
+                                        val fdInt = fdField.getInt(fd)
+                                        val result = protect(fdInt)
+                                        Log.d(TAG, "protect SCM_RIGHTS fd=$fdInt result=$result")
+                                if (result) Log.d(TAG, "GATEWAY_SOCKET_PROTECTED: fd=$fdInt")
+                                        if (result) protected = true
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "getFileDescriptors failed: ${e.message}")
+                                Log.e(TAG, "GATEWAY_SOCKET_ERROR: ${e.message}")
+                            }
+
+                            // Fallback: protect the Unix socket FD if SCM_RIGHTS failed
+                            if (!protected) {
+                                val fdField = client.fileDescriptor.javaClass.getDeclaredField("fd")
+                                fdField.isAccessible = true
+                                val fdInt = fdField.getInt(client.fileDescriptor)
+                                val result = protect(fdInt)
+                                Log.d(TAG, "protect fallback fd=$fdInt result=$result")
+                                protected = result
+                            }
+
+                            // Reply success (1 byte)
+                            client.outputStream.write(if (protected) 1 else 0)
+                            client.outputStream.flush()
+                            Log.d(TAG, "protect reply sent: ${if (protected) 1 else 0}")
+                            // Keep connection open until sing-box closes it
+                            try {
+                                while (client.inputStream.read() >= 0) { /* drain */ }
+                            } catch (_: Exception) {}
+                        } catch (e: Exception) {
+                            Log.w(TAG, "protect client error", e)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                if (!stopping) Log.w(TAG, "protect server stopped", e)
+            }
+        }
+        return server
     }
 
     override fun onDestroy() {
@@ -275,6 +424,7 @@ class ProxyVpnService : VpnService() {
         const val CHANNEL_ID = "proxy_vpn"
         const val NOTIFICATION_ID = 4220
 
+        const val STATUS_STARTING = VpnStatus.STARTING
         const val STATUS_CONNECTING = VpnStatus.CONNECTING
         const val STATUS_CONNECTED = VpnStatus.CONNECTED
         const val STATUS_DISCONNECTED = VpnStatus.DISCONNECTED

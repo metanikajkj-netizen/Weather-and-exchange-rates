@@ -11,6 +11,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
@@ -34,10 +35,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.weathercurrency.app.proxy.ProxyVpnViewModel
 import com.weathercurrency.app.ui.MainScreen
+import com.weathercurrency.app.subscription.AdminViewModel
+import com.weathercurrency.app.subscription.SubscriptionViewModel
+import com.weathercurrency.app.ui.AdminScreen
 import com.weathercurrency.app.ui.ProxyVpnScreen
+import com.weathercurrency.app.ui.SplitTunnelScreen
+import com.weathercurrency.app.ui.VpnDiagnosticsScreen
 import com.weathercurrency.app.ui.UpdateScreen
 import com.weathercurrency.app.ui.theme.WeatherCurrencyTheme
 import com.weathercurrency.app.update.UpdateNotifier
@@ -74,6 +83,11 @@ class MainActivity : ComponentActivity() {
         val viewModel: MainViewModel by viewModels { MainViewModel.factory(this) }
         val updateViewModel: UpdateViewModel by viewModels { UpdateViewModel.factory(this) }
         val proxyViewModel: ProxyVpnViewModel by viewModels { ProxyVpnViewModel.factory(this) }
+        val subViewModel: SubscriptionViewModel by viewModels { SubscriptionViewModel.factory(this) }
+        val adminViewModel: AdminViewModel by viewModels { AdminViewModel.factory() }
+        val diagViewModel: com.weathercurrency.app.diagnostics.VpnDiagnosticsViewModel by viewModels {
+            com.weathercurrency.app.diagnostics.VpnDiagnosticsViewModel.factory(this)
+        }
         proxyVmRef = proxyViewModel
 
         // Ensure notification channel exists; request POST_NOTIFICATIONS on 13+ once.
@@ -95,6 +109,9 @@ class MainActivity : ComponentActivity() {
                     val state by viewModel.uiState.collectAsStateWithLifecycle()
                     val updateState by updateViewModel.ui.collectAsStateWithLifecycle()
                     val proxyState by proxyViewModel.ui.collectAsStateWithLifecycle()
+                    val subState by subViewModel.ui.collectAsStateWithLifecycle()
+                    val adminState by adminViewModel.ui.collectAsStateWithLifecycle()
+                    val diagState by diagViewModel.state.collectAsStateWithLifecycle()
 
                     val drawerState = rememberDrawerState(DrawerValue.Closed)
                     val scope = rememberCoroutineScope()
@@ -117,6 +134,18 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // Sync subscription on app resume (return from background).
+                    val lifecycleOwner = LocalLifecycleOwner.current
+                    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+                        val observer = LifecycleEventObserver { _, event ->
+                            if (event == Lifecycle.Event.ON_RESUME) {
+                                subViewModel.onResume()
+                            }
+                        }
+                        lifecycleOwner.lifecycle.addObserver(observer)
+                        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+                    }
+
                     fun openDrawer() {
                         scope.launch { drawerState.open() }
                     }
@@ -129,12 +158,21 @@ class MainActivity : ComponentActivity() {
                     }
 
                     fun requestVpnAndConnect() {
-                        val prepare = VpnService.prepare(this@MainActivity)
-                        if (prepare != null) {
-                            proxyViewModel.onVpnPermissionRequired()
-                            vpnPermissionLauncher.launch(prepare)
-                        } else {
-                            proxyViewModel.connect()
+                        // TASK26.5: server-side subscription gate before any VPN start.
+                        val scope = this@MainActivity.let { it }
+                        kotlinx.coroutines.MainScope().launch {
+                            val allowed = subViewModel.prepareVpnCredentials()
+                            if (!allowed) {
+                                currentScreen = SCREEN_PROXY
+                                return@launch
+                            }
+                            val prepare = VpnService.prepare(this@MainActivity)
+                            if (prepare != null) {
+                                proxyViewModel.onVpnPermissionRequired()
+                                vpnPermissionLauncher.launch(prepare)
+                            } else {
+                                proxyViewModel.connect()
+                            }
                         }
                     }
 
@@ -145,7 +183,12 @@ class MainActivity : ComponentActivity() {
                                 Text(
                                     text = "Погода и Валюта",
                                     style = MaterialTheme.typography.titleLarge,
-                                    modifier = Modifier.padding(20.dp, 24.dp, 20.dp, 12.dp)
+                                    modifier = Modifier
+                                        .padding(20.dp, 24.dp, 20.dp, 12.dp)
+                                        .combinedClickable(
+                                            onClick = {},
+                                            onLongClick = { closeDrawerTo(SCREEN_ADMIN) }
+                                        )
                                 )
                                 NavigationDrawerItem(
                                     label = { Text("Главная") },
@@ -165,6 +208,7 @@ class MainActivity : ComponentActivity() {
                                     onClick = { closeDrawerTo(SCREEN_PROXY) },
                                     modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding)
                                 )
+                                // Admin panel hidden: long-press title above (users must not see entry).
                             }
                         }
                     ) {
@@ -179,12 +223,59 @@ class MainActivity : ComponentActivity() {
                                 onNotifyChange = { updateViewModel.setNotifyEnabled(it) }
                             )
 
+                            SCREEN_ADMIN -> AdminScreen(
+                                state = adminState,
+                                onMenuClick = { openDrawer() },
+                                onField = { f -> adminViewModel.onField(f) },
+                                onLogin = { adminViewModel.login() },
+                                onLogout = { adminViewModel.logout() },
+                                onLoadAll = { adminViewModel.loadAll() },
+                                onCreatePromo = { adminViewModel.createPromo() },
+                                onRevokePromo = { id -> adminViewModel.revokePromo(id) },
+                                onExtend = { adminViewModel.extend() },
+                                onTransfer = { adminViewModel.transfer() },
+                                onRevokeDevice = { adminViewModel.revokeDevice() },
+                                onLoadUsers = { adminViewModel.loadUsersList() },
+                                onSelectUser = { id -> adminViewModel.selectUser(id) },
+                                onCloseProfile = { adminViewModel.closeProfile() },
+                                onEditName = { name -> adminViewModel.onField { it.copy(editName = name) } },
+                                onSaveName = { adminViewModel.updateUserName() },
+                                onSearch = { q -> adminViewModel.onSearch(q) },
+                                onSort = { s -> adminViewModel.onSort(s) },
+                                onOpenUsers = { adminViewModel.openUsers() },
+                                onCloseUsers = { adminViewModel.closeUsers() },
+                                onExtendDaysChange = { d -> adminViewModel.onExtendDaysChange(d) },
+                                onExtendFromProfile = { adminViewModel.extendFromProfile() },
+                                onToggleArchived = { adminViewModel.toggleArchived() },
+                                onArchiveUser = { adminViewModel.archiveUser() },
+                                onRestoreUser = { adminViewModel.restoreUser() },
+                                onConsumeExtendResult = { adminViewModel.consumeExtendResult() },
+                                onConsumeArchiveResult = { adminViewModel.consumeArchiveResult() },
+                                onConsumeMessage = { adminViewModel.consumeMessage() }
+                            )
+
                             SCREEN_PROXY -> ProxyVpnScreen(
                                 state = proxyState,
+                                subState = subState,
                                 onMenuClick = { openDrawer() },
                                 onTest = { proxyViewModel.runTest() },
                                 onConnect = { requestVpnAndConnect() },
                                 onDisconnect = { proxyViewModel.disconnect() },
+                                onPromoChange = { c -> subViewModel.onPromoCodeChange(c) },
+                                onActivatePromo = { subViewModel.activatePromo() },
+                                onRefreshSub = { subViewModel.refresh() },
+                                onDiagnostics = { currentScreen = SCREEN_DIAG },
+                                onSplitTunnel = { currentScreen = SCREEN_SPLIT_TUNNEL },
+                            )
+
+                            SCREEN_DIAG -> VpnDiagnosticsScreen(
+                                state = diagState,
+                                onBack = { currentScreen = SCREEN_PROXY },
+                                onRun = { diagViewModel.runDiagnostics() },
+                            )
+
+                            SCREEN_SPLIT_TUNNEL -> SplitTunnelScreen(
+                                onBack = { currentScreen = SCREEN_PROXY }
                             )
 
                             else -> MainScreen(
@@ -294,6 +385,9 @@ class MainActivity : ComponentActivity() {
         private const val SCREEN_HOME = "home"
         private const val SCREEN_UPDATE = "update"
         private const val SCREEN_PROXY = "proxy"
+        private const val SCREEN_ADMIN = "admin"
+        private const val SCREEN_SPLIT_TUNNEL = "split_tunnel"
+        private const val SCREEN_DIAG = "diag"
         const val EXTRA_OPEN_PROXY_VPN = "open_proxy_vpn"
     }
 }

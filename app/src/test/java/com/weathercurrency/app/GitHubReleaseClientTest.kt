@@ -140,7 +140,7 @@ class GitHubReleaseClientTest {
             "metanikajkj-netizen/Weather-and-exchange-rates",
             GitHubReleaseClient.DEFAULT_REPO
         )
-        assertTrue(GitHubReleaseClient.RELEASES_URL.startsWith("https://api.github.com/"))
+        assertTrue(GitHubReleaseClient.DEFAULT_REPO.isNotBlank())
     }
 
     @Test

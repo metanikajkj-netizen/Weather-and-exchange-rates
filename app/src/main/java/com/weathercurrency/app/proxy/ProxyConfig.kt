@@ -12,14 +12,18 @@ data class ProxyConfig(
     val username: String = "",
     val password: String = ""
 ) {
-    enum class Type { HTTP, HTTPS }
+    enum class Type { HTTP, HTTPS, RELAY }
 
     val isConfigured: Boolean
         get() = host.isNotBlank() && port in 1..65535
 
-    /** Builds proxy URL for tun2socks engine: http(s)://[user:pass@]host:port */
+    /** Builds proxy URL for tun2socks engine: http(s):// or relay://[user:pass@]host:port */
     fun toProxyUrl(): String {
-        val scheme = if (type == Type.HTTPS) "https" else "http"
+        val scheme = when (type) {
+            Type.HTTPS -> "https"
+            Type.RELAY -> "relay"
+            else -> "http"
+        }
         val auth = if (username.isNotBlank()) {
             val u = java.net.URLEncoder.encode(username, "UTF-8")
             val p = java.net.URLEncoder.encode(password, "UTF-8")
@@ -37,7 +41,7 @@ data class ProxyConfig(
          */
         fun validate(type: String?, host: String?, port: String?, username: String?, password: String?): String? {
             val t = type?.trim()?.uppercase()
-            if (t != "HTTP" && t != "HTTPS") return "Тип прокси: выберите HTTP или HTTPS"
+            if (t != "HTTP" && t != "HTTPS" && t != "RELAY") return "Тип прокси: выберите HTTP, HTTPS или RELAY"
             val h = host?.trim().orEmpty()
             if (h.isEmpty()) return "Укажите IP-адрес или домен прокси"
             if (h.any { it.isWhitespace() }) return "Хост не должен содержать пробелов"
@@ -57,7 +61,10 @@ data class ProxyConfig(
             return null
         }
 
-        fun parseType(raw: String?): Type =
-            if (raw?.trim()?.equals("HTTPS", ignoreCase = true) == true) Type.HTTPS else Type.HTTP
+        fun parseType(raw: String?): Type = when (raw?.trim()?.uppercase()) {
+            "HTTPS" -> Type.HTTPS
+            "RELAY" -> Type.RELAY
+            else -> Type.HTTP
+        }
     }
 }

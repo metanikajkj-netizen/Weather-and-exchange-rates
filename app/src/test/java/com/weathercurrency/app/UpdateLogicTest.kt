@@ -72,6 +72,44 @@ class UpdateLogicTest {
         assertNull(UpdateLogic.parseMetadata(body))
     }
 
+    @Test
+    fun parseMetadataMissingPackageNameRejected() {
+        // Regression: v2.8.23 release body had no packageName field
+        val body = """UPDATE_META {"versionCode":43,"versionName":"2.8.23","apkFileName":"a.apk","sha256":"${"ab".repeat(32)}"}"""
+        assertNull(UpdateLogic.parseMetadata(body))
+    }
+
+    @Test
+    fun parseMetadataMissingApkFileNameRejected() {
+        // Regression: v2.8.23 used "apkName" instead of "apkFileName"
+        val body = """UPDATE_META {"packageName":"com.weathercurrency.app","versionCode":43,"versionName":"2.8.23","apkName":"WeatherCurrency-v2.8.23.apk","sha256":"${"ab".repeat(32)}"}"""
+        assertNull(UpdateLogic.parseMetadata(body))
+    }
+
+    @Test
+    fun parseMetadataExactV2823BrokenFormatRejected() {
+        // The exact body published in v2.8.23 before the fix — must be rejected
+        val body = """TASK 30.4: Fix empty users list.
+
+UPDATE_META {"versionName":"2.8.23","versionCode":43,"apkName":"WeatherCurrency-v2.8.23.apk","sha256":"4d0c47ec84388183be21deaeb4ba28fc896099eaa11fde57d367db4128355041","minVersionCode":1}"""
+        assertNull(UpdateLogic.parseMetadata(body))
+    }
+
+    @Test
+    fun parseMetadataCorrectV2823FormatAccepted() {
+        // The fixed v2.8.23 body — must parse correctly
+        val body = """TASK 30.4: Fix empty users list.
+
+UPDATE_META {"packageName":"com.weathercurrency.app","versionCode":43,"versionName":"2.8.23","apkFileName":"WeatherCurrency-v2.8.23.apk","sha256":"4d0c47ec84388183be21deaeb4ba28fc896099eaa11fde57d367db4128355041"}"""
+        val m = UpdateLogic.parseMetadata(body)
+        assertNotNull(m)
+        assertEquals("com.weathercurrency.app", m!!.packageName)
+        assertEquals(43, m.versionCode)
+        assertEquals("2.8.23", m.versionName)
+        assertEquals("WeatherCurrency-v2.8.23.apk", m.apkFileName)
+        assertEquals("4d0c47ec84388183be21deaeb4ba28fc896099eaa11fde57d367db4128355041", m.sha256)
+    }
+
     // ---- version compare by versionCode ----
 
     @Test
