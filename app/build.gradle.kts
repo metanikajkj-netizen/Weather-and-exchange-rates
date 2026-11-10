@@ -6,8 +6,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionCode = 56
-val appVersionName = "2.8.36"
+val appVersionCode = 57
+val appVersionName = "2.8.37"
 
 android {
     namespace = "com.weathercurrency.app"

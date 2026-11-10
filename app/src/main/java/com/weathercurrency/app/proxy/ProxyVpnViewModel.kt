@@ -169,12 +169,45 @@ class ProxyVpnViewModel(application: Application) : AndroidViewModel(application
     private fun doStart() {
         if (_ui.value.vpnState == VpnUiState.Connecting) return
         _ui.update { it.copy(vpnState = VpnUiState.Connecting, vpnMessage = "Подключение…") }
-        try {
-            ProxyVpnService.start(app)
-        } catch (e: Exception) {
-            NetworkDiag.logError("ProxyVpnVM.start", e)
-            _ui.update {
-                it.copy(vpnState = VpnUiState.Error, vpnMessage = "Ошибка соединения")
+        // TASK 32.5: Refresh VPN credentials before starting service.
+        // Without this, reconnect fails when stored creds expire.
+        // Same logic as runTest() — fetch fresh creds from Auth API if needed.
+        viewModelScope.launch {
+            val cfg = withContext(Dispatchers.IO) {
+                var c = com.weathercurrency.app.subscription.SubscriptionStore(app).vpnConfigSync()
+                if (c == null || !c.isConfigured) {
+                    try {
+                        val api = com.weathercurrency.app.subscription.SubscriptionApi()
+                        val did = com.weathercurrency.app.subscription.SubscriptionStore(app).deviceId()
+                        if (!did.isNullOrBlank()) {
+                            val nonce = api.challenge(did)
+                            val sig = android.util.Base64.encodeToString(
+                                com.weathercurrency.app.subscription.DeviceIdentity.sign(nonce.toByteArray()),
+                                android.util.Base64.NO_WRAP
+                            )
+                            val creds = api.vpnCredentials(did, nonce, sig)
+                            com.weathercurrency.app.subscription.SubscriptionStore(app)
+                                .saveVpnCreds(creds.username, creds.password, creds.expiresAt)
+                            c = com.weathercurrency.app.subscription.SubscriptionStore(app).vpnConfigSync()
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                c
+            }
+            if (cfg == null || !cfg.isConfigured) {
+                _ui.update {
+                    it.copy(vpnState = VpnUiState.Error, vpnMessage = "Ошибка соединения")
+                }
+                return@launch
+            }
+            try {
+                ProxyVpnService.start(app)
+            } catch (e: Exception) {
+                NetworkDiag.logError("ProxyVpnVM.start", e)
+                _ui.update {
+                    it.copy(vpnState = VpnUiState.Error, vpnMessage = "Ошибка соединения")
+                }
             }
         }
     }
