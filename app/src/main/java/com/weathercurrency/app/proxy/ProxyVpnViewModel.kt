@@ -137,7 +137,7 @@ class ProxyVpnViewModel(application: Application) : AndroidViewModel(application
      */
     fun connect() {
         val st = _ui.value.vpnState
-        if (st == VpnUiState.Connecting || st == VpnUiState.Connected) return
+        if (st == VpnUiState.Connecting) return
         // Subscription gate runs in Activity/Tile before this call (TASK26.5).
         // Service loads per-device creds from SubscriptionStore itself.
         doStart()
@@ -180,7 +180,7 @@ class ProxyVpnViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun disconnect() {
-        if (_ui.value.vpnState != VpnUiState.Connected) return
+        if (_ui.value.vpnState == VpnUiState.Disconnected) return
         try {
             ProxyVpnService.stop(app)
             _ui.update { it.copy(vpnState = VpnUiState.Disconnected, vpnMessage = "Отключено") }

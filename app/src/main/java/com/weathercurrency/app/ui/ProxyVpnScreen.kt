@@ -10,6 +10,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,15 +26,28 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,6 +60,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
@@ -55,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.weathercurrency.app.proxy.ProxyUiState
 import com.weathercurrency.app.proxy.VpnUiState
+import com.weathercurrency.app.subscription.SubscriptionUiState
 
 // Premium Dark Blue / Frosted Glass palette (TASK25).
 private val BgDeep = Color(0xFF0C1728)
@@ -82,16 +98,22 @@ private fun statusFor(state: ProxyUiState): StatusUi = when {
 }
 
 /**
- * Proxy VPN screen v2.6: two round buttons only — no IP/port/user/password fields.
- * Uses [ProxyEmbedded] config via the ViewModel/Service; never renders secrets.
+ * Unified VPN screen (TASK29.5): connection status + subscription + promo in one block.
+ * Replaces separate «VPN-подписка» screen. Uses per-device gateway credentials.
  */
 @Composable
 fun ProxyVpnScreen(
     state: ProxyUiState,
+    subState: SubscriptionUiState,
     onMenuClick: () -> Unit,
     onTest: () -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onPromoChange: (String) -> Unit,
+    onActivatePromo: () -> Unit,
+    onRefreshSub: () -> Unit,
+    onDiagnostics: () -> Unit = {},
+    onSplitTunnel: () -> Unit = {}
 ) {
     val status = statusFor(state)
     val statusColor by animateColorAsState(status.dot, label = "statusColor")
@@ -120,14 +142,30 @@ fun ProxyVpnScreen(
     val connected = state.vpnState == VpnUiState.Connected
     val buttonEnabled = !connBusy && !testBusy
 
+    val subOk = subState.expiresAt > (System.currentTimeMillis() / 1000 + subState.serverTimeOffset)
+    var promoExpanded by remember { mutableStateOf(!subOk) }
+
+    // Live countdown for short subscriptions (< 1 day)
+    var nowSec by remember { mutableStateOf(System.currentTimeMillis() / 1000) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            nowSec = System.currentTimeMillis() / 1000 + subState.serverTimeOffset
+            kotlinx.coroutines.delay(1000)
+        }
+    }
+    val remainingSec = if (subState.expiresAt > 0) (subState.expiresAt - nowSec).coerceAtLeast(0) else 0
+    val isShortSub = subOk && remainingSec in 1..86399 // < 1 day
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(BgDeep)
             .windowInsetsPadding(WindowInsets.safeDrawing)
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        // Header
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -136,33 +174,16 @@ fun ProxyVpnScreen(
                 Icon(Icons.Default.Menu, contentDescription = "Меню", tint = TextSecondary)
             }
             Text(
-                text = "Proxy VPN",
+                text = "VPN",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
                 color = TextPrimary,
             )
         }
 
-        Spacer(Modifier.height(28.dp))
+        Spacer(Modifier.height(16.dp))
 
-        Text(
-            text = "Защищённое соединение",
-            style = MaterialTheme.typography.headlineMedium,
-            fontWeight = FontWeight.Bold,
-            color = TextPrimary,
-            textAlign = TextAlign.Center,
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = "Быстро. Просто. Без настроек.",
-            style = MaterialTheme.typography.bodyLarge,
-            color = TextSecondary,
-            textAlign = TextAlign.Center,
-        )
-
-        Spacer(Modifier.height(28.dp))
-
-        // Compact state indicator
+        // Connection status indicator
         Box(
             modifier = Modifier
                 .clip(CircleShape)
@@ -200,8 +221,8 @@ fun ProxyVpnScreen(
             }
         }
 
-        Spacer(Modifier.height(12.dp))
         if (state.permissionNeeded) {
+            Spacer(Modifier.height(8.dp))
             Text(
                 text = "Подтвердите разрешение системы на VPN",
                 style = MaterialTheme.typography.bodySmall,
@@ -210,7 +231,62 @@ fun ProxyVpnScreen(
             )
         }
 
-        Spacer(Modifier.height(36.dp))
+        Spacer(Modifier.height(20.dp))
+
+        // Subscription card (compact)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(CardBlue)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    Modifier.size(10.dp).clip(CircleShape)
+                        .background(if (subOk) StateGreen else StateRed)
+                )
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = if (subOk) "Подписка активна" else "Нет активной подписки",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (subOk) StateGreen else StateRed,
+                    )
+                    if (subOk) {
+                        val displayText = if (isShortSub) {
+                            val h = remainingSec / 3600
+                            val m = (remainingSec % 3600) / 60
+                            val s = remainingSec % 60
+                            if (h > 0) "Осталось %02d:%02d:%02d".format(h, m, s)
+                            else "Осталось %02d:%02d".format(m, s)
+                        } else {
+                            "Осталось ${subState.daysLeft} дн." +
+                                (if (subState.expiresAt > 0) " · до ${java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.getDefault()).format(java.util.Date(subState.expiresAt * 1000))}" else "")
+                        }
+                        Text(
+                            text = displayText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
+                }
+                IconButton(onClick = onRefreshSub, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "Обновить",
+                        tint = TextSecondary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
 
         // Two large round buttons
         Row(
@@ -274,9 +350,9 @@ fun ProxyVpnScreen(
             }
         }
 
-        Spacer(Modifier.height(36.dp))
+        Spacer(Modifier.height(16.dp))
 
-        // Test / connection message (user-facing only)
+        // Test / connection message
         val message = when {
             state.testing -> null
             state.testSuccess == true -> buildString {
@@ -301,7 +377,116 @@ fun ProxyVpnScreen(
             )
         }
 
+        Spacer(Modifier.height(16.dp))
+
+        // Diagnostics button (always visible)
+        OutlinedButton(
+            onClick = onDiagnostics,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft),
+            border = ButtonDefaults.outlinedButtonBorder.copy(
+                brush = androidx.compose.ui.graphics.SolidColor(AccentSoft.copy(alpha = 0.5f)),
+            ),
+        ) {
+            Text("Диагностика VPN", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        }
+
         Spacer(Modifier.height(8.dp))
+
+        // Split tunneling button
+        OutlinedButton(
+            onClick = onSplitTunnel,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft),
+            border = ButtonDefaults.outlinedButtonBorder.copy(
+                brush = androidx.compose.ui.graphics.SolidColor(AccentSoft.copy(alpha = 0.5f)),
+            ),
+        ) {
+            Text("Раздельное туннелирование", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // Promo code section (expandable)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(CardBlue),
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { promoExpanded = !promoExpanded },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Активировать промокод",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = TextPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        imageVector = if (promoExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                        contentDescription = null,
+                        tint = TextSecondary,
+                    )
+                }
+
+                if (promoExpanded) {
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = subState.promoCode,
+                        onValueChange = onPromoChange,
+                        label = { Text("Промокод") },
+                        singleLine = true,
+                        colors = TextFieldDefaults.colors(
+                            focusedTextColor = TextPrimary,
+                            unfocusedTextColor = TextPrimary,
+                            focusedContainerColor = CardRaised,
+                            unfocusedContainerColor = CardRaised,
+                            focusedIndicatorColor = AccentBlue,
+                            unfocusedIndicatorColor = StateGray,
+                            focusedLabelColor = AccentSoft,
+                            unfocusedLabelColor = TextSecondary,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Button(
+                        onClick = onActivatePromo,
+                        enabled = !subState.activating && subState.promoCode.isNotBlank(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AccentBlue,
+                            contentColor = Color(0xFF0C1728),
+                            disabledContainerColor = CardRaised,
+                            disabledContentColor = StateGray,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        if (subState.activating) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = Color(0xFF0C1728))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Активация…")
+                        } else {
+                            Text("Активировать")
+                        }
+                    }
+                    subState.message?.let {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = it,
+                            color = if (it.contains("Не удалось") || it.contains("Нет ")) StateRed else StateGreen,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
         Text(
             text = "Без ввода адресов и паролей — всё уже настроено",
             style = MaterialTheme.typography.bodySmall,
@@ -376,7 +561,6 @@ private fun CircleActionButton(
                     )
                 },
         ) {
-            // Soft inner ring
             Box(
                 Modifier
                     .fillMaxSize()
@@ -408,14 +592,13 @@ private fun CircleActionButton(
     }
 }
 
-/** Minimal power glyph (circle + vertical bar) — avoids extended icon dependency. */
+/** Minimal power glyph (circle + vertical bar). */
 @Composable
 private fun PowerIcon(tint: Color, modifier: Modifier = Modifier) {
     Canvas(modifier) {
         val w = size.width
         val h = size.height
         val stroke = w * 0.09f
-        // Arc: power circle with gap at top
         drawArc(
             color = tint,
             startAngle = -55f,
@@ -425,7 +608,6 @@ private fun PowerIcon(tint: Color, modifier: Modifier = Modifier) {
             topLeft = Offset(stroke / 2f, stroke / 2f),
             size = androidx.compose.ui.geometry.Size(w - stroke, h - stroke),
         )
-        // Vertical bar
         drawLine(
             color = tint,
             start = Offset(w / 2f, h * 0.12f),

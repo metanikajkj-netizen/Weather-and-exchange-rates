@@ -38,6 +38,7 @@ class ProxyVpnService : VpnService() {
     private var tunPfd: ParcelFileDescriptor? = null
     private var engineRunning = false
     @Volatile private var stopping = false
+    @Volatile private var startGeneration = 0
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var protectServerRef: android.net.LocalServerSocket? = null
 
@@ -138,10 +139,10 @@ class ProxyVpnService : VpnService() {
             // TASK 33.6.9: Direct HTTP CONNECT proxy (no VLESS).
             // sing-box TUN -> HTTP CONNECT Proxy -> Internet
             // TUN FD is passed via PlatformInterface (not config "device" option)
-            key.setProxyHost("141.11.162.93")
-            key.setProxyPort(47194)
-            key.setUsername("7NP61VKC")
-            key.setPassword("OGC4QIDG")
+            key.setProxyHost(cfg.host)
+            key.setProxyPort(cfg.port.toLong())
+            key.setUsername(cfg.username)
+            key.setPassword(cfg.password)
             key.setLogLevel("info")
             key.setMTU(0)
 
@@ -164,7 +165,16 @@ class ProxyVpnService : VpnService() {
 
             Log.d(TAG, "ENGINE_START: inserting key and starting engine")
             Engine.insert(key)
-            Engine.start()
+            try {
+                Engine.start()
+            } catch (e: Exception) {
+                Log.e(TAG, "ENGINE_START_FAILED: ${e.message}")
+                sendStatus(STATUS_ERROR, "Ошибка запуска движка")
+                cleanupEngine()
+                stopForegroundCompat()
+                stopSelf()
+                return
+            }
             engineRunning = true
             // TASK 32.4.5: ENGINE_READY deferred - verified via Engine.isRunning() below
             // Gateway diagnostics: DNS, socket protection, TCP, TLS
@@ -179,10 +189,17 @@ class ProxyVpnService : VpnService() {
                 }
             }
 
-            // TASK 32.4.5: Verify engine actually started
+            // TASK 32.4.5/32.4.7: Verify engine actually started
+            // Use generation counter to prevent stale callbacks from affecting new sessions
+            val myGeneration = ++startGeneration
             sendStatus(STATUS_STARTING, "Запуск VPN...")
             thread {
                 Thread.sleep(2000)
+                // Skip if a new session started or we're stopping
+                if (myGeneration != startGeneration || stopping) {
+                    Log.d(TAG, "ENGINE_CHECK_SKIP: stale generation $myGeneration != $startGeneration")
+                    return@thread
+                }
                 if (engineRunning && Engine.isRunning()) {
                     Log.d(TAG, "ENGINE_READY: engine confirmed running")
                     sendStatus(STATUS_CONNECTED, "VPN подключён")
