@@ -134,6 +134,7 @@ class ProxyVpnService : VpnService() {
             tunPfd = null
 
             val key = Key()
+            key.setDevice("fd://$tunFd")
             // TASK 33.6.9: Direct HTTP CONNECT proxy (no VLESS).
             // sing-box TUN -> HTTP CONNECT Proxy -> Internet
             // TUN FD is passed via PlatformInterface (not config "device" option)
@@ -165,7 +166,7 @@ class ProxyVpnService : VpnService() {
             Engine.insert(key)
             Engine.start()
             engineRunning = true
-            Log.d(TAG, "ENGINE_READY: engine started successfully")
+            // TASK 32.4.5: ENGINE_READY deferred - verified via Engine.isRunning() below
             // Gateway diagnostics: DNS, socket protection, TCP, TLS
             thread {
                 Thread.sleep(500)
@@ -178,18 +179,18 @@ class ProxyVpnService : VpnService() {
                 }
             }
 
-            // TASK 33.6.9: Show STARTING first, then CONNECTED after engine confirms
+            // TASK 32.4.5: Verify engine actually started
             sendStatus(STATUS_STARTING, "Запуск VPN...")
-            // Give engine time to start, then confirm
             thread {
-                Thread.sleep(1000)
+                Thread.sleep(2000)
                 if (engineRunning && Engine.isRunning()) {
+                    Log.d(TAG, "ENGINE_READY: engine confirmed running")
                     sendStatus(STATUS_CONNECTED, "VPN подключён")
                     Log.d(TAG, "VPN_TRAFFIC_RX: monitoring started")
                     Log.d(TAG, "VPN_TRAFFIC_TX: monitoring started")
                     Log.i(TAG, "VPN started proxy=${cfg.host}:${cfg.port} type=${cfg.type}")
                 } else {
-                    Log.e(TAG, "Engine failed to start")
+                    Log.e(TAG, "ENGINE_FAILED: Engine.isRunning() returned false")
                     sendStatus(STATUS_ERROR, "Ошибка запуска движка")
                     cleanupEngine()
                     stopForegroundCompat()
